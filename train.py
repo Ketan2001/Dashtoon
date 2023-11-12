@@ -1,8 +1,13 @@
 import numpy as np
 import torch
 from utils import *
+
+# Outlined in Johnson et al.
 from transformer import TransformerNet
+
+# pretrained VGG to extract features form relu_1_2, relu_2_2, relu_3_3 and relu_4_3
 from vgg import PerceptualLossNet
+
 from torch.optim import Adam
 import time
 from PIL import Image
@@ -10,12 +15,17 @@ import os
 import pickle
 from torch.utils.data import random_split
 
-# GLOBAL SETTINGS
-NUM_TRAIN_IMAGES = 50000  # Set to -1 to use all (~83k) Images
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+# Hyperparameters
 TRAIN_IMAGE_SIZE = 256
 DATASET_PATH = "./data"
 NUM_EPOCHS = 1
 STYLE_IMAGE_PATH = "./style_image.jpeg"
+CONTENT_IMAGE_PATH = "content.jpeg"
 BATCH_SIZE = 4
 CONTENT_WEIGHT = 1e0
 STYLE_WEIGHT = 4e5
@@ -23,108 +33,198 @@ TV_WEIGHT = 1e-6
 LR = 0.001
 SAVE_MODEL_PATH = "./checkpoints"
 SAVE_IMAGE_PATH = "./image_outputs"
-SAVE_MODEL_EVERY = 500  # 2,000 Images with batch size 4
+CHECKPOINT_FREQ = 150
+LOG_FREQ = 50
+
+# Setting the seed value for reproducibility
 SEED = 42
-CHECKPOINT_FREQ = 500
-LOG_FREQ = 250
+
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+np.random.seed(SEED)
 
 
-def train():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+class StyleTransfer:
+    def __init__(
+        self,
+        num_epochs=NUM_EPOCHS,
+        image_size=TRAIN_IMAGE_SIZE,
+        dataset_path=DATASET_PATH,
+        style_image_path=STYLE_IMAGE_PATH,
+        content_image_path=CONTENT_IMAGE_PATH,
+        batch_size=BATCH_SIZE,
+        style_weight=STYLE_WEIGHT,
+        content_weight=CONTENT_WEIGHT,
+        tv_weight=TV_WEIGHT,
+        log_freq=LOG_FREQ,
+        checkpoint_freq=CHECKPOINT_FREQ,
+        lr=LR,
+        save_model_path=SAVE_MODEL_PATH,
+        save_image_path=SAVE_IMAGE_PATH
+    ):
+        self.epochs = num_epochs
+        self.image_size = image_size
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_size = batch_size
+        self.dataset_path = dataset_path
+        self.style_image_path = style_image_path
+        self.content_image_path = content_image_path
+        self.content_weight = content_weight
+        self.style_weight = style_weight
+        self.tv_weight = tv_weight
+        self.lr = lr
+        self.log_freq = log_freq
+        self.checkpoint_freq = checkpoint_freq
+        self.save_model_path = save_model_path
+        self.save_image_path = save_image_path
 
-    # prepare data loader
-    print("Loading Data...")
-    train_loader, val_loader = get_training_data_loader(DATASET_PATH, TRAIN_IMAGE_SIZE, BATCH_SIZE)
-    print("Data Loaded Successfully \n")
+        # load data
+        print("Loading Data...")
+        self.train_loader, self.val_loader = get_training_data_loader(dataset_path, image_size, batch_size)
+        print("Data Loaded Successfully \n")
+        
+        # instantiate networks
+        self.transformer_net = TransformerNet().train().to(self.device)
+        self.perceptual_loss_net = PerceptualLossNet(requires_grad=False).to(self.device)
 
-    # prepare neural networks
-    transformer_net = TransformerNet().train().to(device)
-    perceptual_loss_net = PerceptualLossNet(requires_grad=False).to(device)
+        self.optimizer = Adam(self.transformer_net.parameters())
 
-    optimizer = Adam(transformer_net.parameters())
+        # Compute Gram matrices for the style image
+        style_img = prepare_img(style_image_path, self.device, batch_size=batch_size)
+        style_img_set_of_feature_maps = self.perceptual_loss_net(style_img)
+        self.target_style_representation = [gram_matrix(x) for x in style_img_set_of_feature_maps]
+        
+        # This image is used to keep track of the subjective performance over the iteration
+        # sotred in the directory "save_image_path" after every log_iter iterations
+        self.test_image = prepare_img(content_image_path, self.device)
+        
+        self.mse_loss = torch.nn.MSELoss(reduction='mean')
 
-    # Calculate style image's Gram matrices (style representation)
-    # Built over feature maps as produced by the perceptual net - VGG16
-    style_img_path = STYLE_IMAGE_PATH
-    style_img = prepare_img(STYLE_IMAGE_PATH, device=device, batch_size=BATCH_SIZE)
-    style_img_set_of_feature_maps = perceptual_loss_net(style_img)
-    target_style_representation = [gram_matrix(x) for x in style_img_set_of_feature_maps]
+        self.best_val_loss = None
+        
+        self.history = {
+            'content_loss_t': [],
+            'style_loss_t': [],
+            'tv_loss_t': [],
+            'total_loss_t': [],
+            'total_loss_v' : []
+        }
+    
+    
+    def train(self):
+        print("Training Started...\n")
+        
+        ts = time.time()
+        
+        acc_content_loss, acc_style_loss, acc_tv_loss = [0., 0., 0.]
+        
+        for epoch in range(self.epochs):
+            for batch_id, (content_batch, _) in enumerate(self.train_loader):
+                # get ouput of transform_net
+                content_batch = content_batch.to(self.device)
+                stylized_batch = self.transformer_net(content_batch)
 
-    test_image = prepare_img('content.jpeg', device)
+                # feed batch of style and content images to the vgg net
+                content_batch_set_of_feature_maps = self.perceptual_loss_net(content_batch)
+                stylized_batch_set_of_feature_maps = self.perceptual_loss_net(stylized_batch)
 
-    lowest_loss = None
+                # compute content loss
+                target_content_representation = content_batch_set_of_feature_maps.relu2_2
+                current_content_representation = stylized_batch_set_of_feature_maps.relu2_2
+                content_loss = self.content_weight * self.mse_loss(target_content_representation, current_content_representation)
+                acc_content_loss += content_loss.item()
+                
+                # compute gram matrices and style loss
+                style_loss = 0.0
+                current_style_representation = [gram_matrix(x) for x in stylized_batch_set_of_feature_maps]
+                for gram_gt, gram_hat in zip(self.target_style_representation, current_style_representation):
+                    style_loss += self.mse_loss(gram_gt, gram_hat)
+                style_loss /= len(self.target_style_representation)
+                style_loss *= self.style_weight
+                acc_style_loss += style_loss.item()
 
-    history = {
-        'content_loss': [],
-        'style_loss': [],
-        'tv_loss': [],
-        'total_loss': []
-    }
+                # compute tv loss
+                tv_loss = self.tv_weight * total_variation(stylized_batch)
+                acc_tv_loss += tv_loss.item()
 
-    print("Started Training...")
-    ts = time.time()
-    for epoch in range(NUM_EPOCHS):
-        for batch_id, (content_batch, _) in enumerate(train_loader):
-            # step1: Feed content batch through transformer net
-            content_batch = content_batch.to(device)
-            stylized_batch = transformer_net(content_batch)
+                # backprop
+                total_loss = content_loss + style_loss + tv_loss
+                total_loss.backward()
+                self.optimizer.step()
 
-            # step2: Feed content and stylized batch through perceptual net (VGG16)
-            content_batch_set_of_feature_maps = perceptual_loss_net(content_batch)
-            stylized_batch_set_of_feature_maps = perceptual_loss_net(stylized_batch)
+                self.optimizer.zero_grad()
+                
+                if (batch_id + 1) % self.log_freq == 0:
+                    with torch.no_grad():
+                        self.history['content_loss_t'].append(acc_content_loss / self.log_freq)
+                        self.history['style_loss_t'].append(acc_style_loss / self.log_freq)
+                        self.history['tv_loss_t'].append(acc_tv_loss / self.log_freq)
+                        self.history['total_loss_t'].append((acc_content_loss + acc_style_loss + acc_tv_loss) / self.log_freq)
 
-            # step3: Calculate content representations and content loss
+                        self.transformer_net.eval()
+                        stylized_test = self.transformer_net(self.test_image).cpu().numpy()[0]
+                        val_loss = self.val_loss()
+                        self.transformer_net.train()
+                        stylized = post_process_image(stylized_test)
+                        stylized_image = Image.fromarray(stylized)
+
+                        stylized_image.save(os.path.join(self.save_image_path, f"iter-{batch_id + 1}.jpeg"))
+                        
+                        
+                        
+                        if self.best_val_loss is None or val_loss < self.best_val_loss:
+                            self.best_val_loss = val_loss
+                            torch.save(self.transformer_net.state_dict(), "best_model.pth")
+                            
+                        print(f'Iter : [{batch_id + 1}/{len(self.train_loader)}]')
+                        print('---------------------\n')
+                        print(f'Time Elapsed : {(time.time() - ts) / 60:.2f} min)')
+                        print('Training Loss :')
+                        print(f'\tContent Loss : {acc_content_loss / self.log_freq}')
+                        print(f'\tStyle Loss : {acc_style_loss / self.log_freq}')
+                        print(f'\tTV Loss : {acc_tv_loss / self.log_freq}')
+                        print(f'\tTotal Loss : {(acc_content_loss + acc_style_loss + acc_tv_loss) / self.log_freq}')
+                        print(f'Validation Loss : {val_loss}\n\n')
+                    
+                        
+                        acc_content_loss, acc_style_loss, acc_tv_loss = [0., 0., 0.]
+
+                
+                if (batch_id + 1) % self.checkpoint_freq == 0:
+                    torch.save(self.transformer_net.state_dict(),
+                               os.path.join(self.save_model_path, f"iter-{batch_id + 1}.pth"))
+
+
+                            
+    def val_loss(self):
+        val_loss = 0.0
+        for batch_id, (content_batch, _) in enumerate(self.val_loader):
+            content_batch = content_batch.to(self.device)
+            stylized_batch = self.transformer_net(content_batch)
+            
+            content_batch_set_of_feature_maps = self.perceptual_loss_net(content_batch)
+            stylized_batch_set_of_feature_maps = self.perceptual_loss_net(stylized_batch)
+            
             target_content_representation = content_batch_set_of_feature_maps.relu2_2
             current_content_representation = stylized_batch_set_of_feature_maps.relu2_2
-            mse_loss = torch.nn.MSELoss(reduction='mean')
-            content_loss = CONTENT_WEIGHT * mse_loss(target_content_representation, current_content_representation)
+            content_loss = self.content_weight * self.mse_loss(target_content_representation, current_content_representation)
 
-            # step4: Calculate style representation and style loss
             style_loss = 0.0
             current_style_representation = [gram_matrix(x) for x in stylized_batch_set_of_feature_maps]
-            for gram_gt, gram_hat in zip(target_style_representation, current_style_representation):
-                style_loss += mse_loss(gram_gt, gram_hat)
-            style_loss /= len(target_style_representation)
-            style_loss *= STYLE_WEIGHT
+            for gram_gt, gram_hat in zip(self.target_style_representation, current_style_representation):
+                style_loss += self.mse_loss(gram_gt, gram_hat)
+            style_loss /= len(self.target_style_representation)
+            style_loss *= self.style_weight
+            
+            tv_loss = self.tv_weight * total_variation(stylized_batch)
 
-            # step5: Calculate total variation loss - enforces image smoothness
-            tv_loss = TV_WEIGHT * total_variation(stylized_batch)
-
-            # step6: Combine losses and do a backprop
-            total_loss = content_loss + style_loss + tv_loss
-            total_loss.backward()
-            optimizer.step()
-
-            optimizer.zero_grad()  # clear gradients for the next round
-
-            with torch.no_grad():
-                history['content_loss'].append(content_loss.item())
-                history['style_loss'].append(style_loss.item())
-                history['tv_loss'].append(tv_loss.item())
-                history['total_loss'].append(total_loss.item())
-
-                if (batch_id + 1) % LOG_FREQ == 0:
-                    print(
-                        f'Iter : [{batch_id + 1}/{len(train_loader)}] \n ------------- \n time elapsed={(time.time() - ts) / 60:.2f} \n c-loss={acc_content_loss / LOG_FREQ}|s-loss={acc_style_loss / LOG_FREQ}|tv-loss={acc_tv_loss / LOG_FREQ}|total loss={(acc_content_loss + acc_style_loss + acc_tv_loss) / LOG_FREQ}')
-                    acc_content_loss, acc_style_loss, acc_tv_loss = [0., 0., 0.]
-
-                    transformer_net.eval()
-                    stylized_test = transformer_net(test_image).cpu().numpy()[0]
-                    transformer_net.train()
-                    stylized = post_process_image(stylized_test)
-                    stylized_image = Image.fromarray(stylized)
-
-                    stylized_image.save(os.path.join(SAVE_IMAGE_PATH, f"iter-{batch_id + 1}.jpeg"))
-
-                if (batch_id + 1) % CHECKPOINT_FREQ == 0:
-                    torch.save(transformer_net.state_dict(),
-                               os.path.join(SAVE_MODEL_PATH, f"Iter-{batch_id + 1}-{total_loss.item() : .4f}.pth"))
-
-                if lowest_loss is None or total_loss.item() < lowest_loss:
-                    lowest_loss = total_loss.item()
-                    torch.save(transformer_net.state_dict(),
-                               f"best_model.pth")
-
+            val_loss += (content_loss + style_loss + tv_loss).item()
+            
+        val_loss /= len(self.val_loader)
+        self.history['total_loss_v'].append(val_loss)
+                
+        return val_loss
 
 if __name__ == "__main__":
-    train()
+    style_transfer = StyleTransfer()
+    style_transfer.train()
