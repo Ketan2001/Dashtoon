@@ -9,7 +9,7 @@ To run these scripts first create a conda environment using the `requirements.tx
 conda create --name <env_name> --file requirements.txt
 ```
 
-The `data/train/` directory should contain extracted images from the MSCOCO dataset which can be downloaded from [MSCOCO204 Train](http://images.cocodataset.org/zips/train2014.zip).
+The `data/train/` directory should contain extracted images from the MSCOCO dataset which can be downloaded from [MSCOCO-2014 Train](http://images.cocodataset.org/zips/train2014.zip).
 
 Launch `jupyter-notebook` and run cells in the `style_transfer_picasso.ipynb` file
 
