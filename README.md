@@ -20,7 +20,9 @@ python3 train.py
 This GIF shows the output of the network on an unseen image over the iterations as the network trained. 
 <br>
 
-![Train GIF](train.gif) ![Content Image](content.jpeg) <img src="style_image.jpeg" alt="Alt Text" width="256" height="256">
+![Train GIF](train.gif) 
+![Content Image](content.jpeg) 
+<img src="style_image.jpeg" alt="Style Image" width="256" height="256">
 
 
 The model with the best validation loss is saved as `best_model.pth`
